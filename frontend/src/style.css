@@ -187,6 +187,15 @@ label input {
     align-items: start;
     gap: 0.15rem 0.75rem;
 }
+.peer-metrics {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+}
+.peer-metrics progress {
+    width: clamp(3rem, 15vw, 6rem);
+    height: 0.55rem;
+}
 .rate {
     font-variant-numeric: tabular-nums;
     color: var(--dim);

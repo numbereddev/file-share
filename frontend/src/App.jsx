@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { Room, ROOM_CODE } from "./room.js";
+import { Room, ROOM_CODE, PROGRESS_MAX } from "./room.js";
 import { openDirectoryDestination } from "./destination.js";
 import { openStagedDestination, pruneStagedDownloads } from "./staging.js";
 import { fromDirectory, fromDrop, fromFiles } from "./selection.js";
@@ -46,12 +46,14 @@ function Peers({ view }) {
             <ul>
                 {[view.host, ...view.members].map((id) => {
                     const host = id === view.host;
+                    const name = host ? "Sender" : `Peer ${id.slice(0, 6)}`;
                     const peer = view.peers?.[id];
+                    const progress = !host && id !== view.me ? view.progress?.[id] : undefined;
                     return (
                         <li key={id}>
                             <div>
                                 <span>
-                                    {host ? "Sender" : `Peer ${id.slice(0, 6)}`}
+                                    {name}
                                     {id === view.me ? " (you)" : ""}
                                 </span>
                                 {peer && (
@@ -61,9 +63,19 @@ function Peers({ view }) {
                                     </small>
                                 )}
                             </div>
-                            <span className="rate">
-                                {formatBytes(host ? total : (speeds[id] ?? 0))}/s
-                            </span>
+                            <div className="peer-metrics">
+                                {progress !== undefined && (
+                                    <progress
+                                        value={progress}
+                                        max={PROGRESS_MAX}
+                                        aria-label={`${name} transfer progress`}
+                                        title={`${Math.floor((progress / PROGRESS_MAX) * 100)}%`}
+                                    />
+                                )}
+                                <span className="rate">
+                                    {formatBytes(host ? total : (speeds[id] ?? 0))}/s
+                                </span>
+                            </div>
                             {peer?.error && <small className="peer-error">{peer.error}</small>}
                         </li>
                     );

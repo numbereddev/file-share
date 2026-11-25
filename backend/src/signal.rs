@@ -35,6 +35,7 @@ const MAX_PAYLOAD: usize = 16 * 1024;
 const OUTBOX_CAPACITY: usize = 2 + 2 * MAX_GUESTS;
 const RATE_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_RATE: u64 = (1_u64 << 53) - 1; // Largest exact integer in a browser's JSON number range.
+const MAX_PROGRESS: u64 = 1000;
 const RATE_CONTROL_RESERVE: usize = 2;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -61,6 +62,7 @@ enum Incoming {
     Rates {
         #[serde(default)]
         rates: Value,
+        progress: Option<Map<String, Value>>,
     },
 }
 
@@ -102,6 +104,8 @@ enum Outgoing<'a> {
     },
     Rates {
         rates: &'a Map<String, Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        progress: Option<&'a Map<String, Value>>,
     },
     Error {
         message: &'static str,
@@ -427,13 +431,28 @@ impl AppState {
         slot.attach(role, socket)
     }
 
-    fn broadcast_rates(&self, session: &Session, rates: Value, now: Instant) {
+    fn broadcast_rates(
+        &self,
+        session: &Session,
+        rates: Value,
+        progress: Option<Map<String, Value>>,
+        now: Instant,
+    ) {
         if !matches!(session.role, Role::Host) {
             return;
         }
         let Some(rates) = rates.as_object().filter(|rates| rates.len() <= MAX_GUESTS) else {
             return;
         };
+        if progress.as_ref().is_some_and(|progress| {
+            progress.len() > rates.len()
+                || !progress.iter().all(|(id, value)| {
+                    rates.contains_key(id)
+                        && value.as_u64().is_some_and(|value| value <= MAX_PROGRESS)
+                })
+        }) {
+            return;
+        }
         let mut rooms = self.0.rooms.lock().expect("rooms lock poisoned");
         let Some(room) = rooms.get_mut(&session.room) else {
             return;
@@ -454,7 +473,11 @@ impl AppState {
             return;
         }
         room.last_rates = Some(now);
-        let text = Outgoing::Rates { rates }.text();
+        let text = Outgoing::Rates {
+            rates,
+            progress: progress.as_ref(),
+        }
+        .text();
         for guest in room.guests.values() {
             if guest.peer.has_space(RATE_CONTROL_RESERVE + 1) {
                 guest.peer.enqueue_text(text.clone());
@@ -653,7 +676,7 @@ async fn run(
                 Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                     Ok(Incoming::Signal { to, signal }) => session.app.relay(session, to, signal),
                     Ok(Incoming::Relay { to }) => session.app.authorize_relay(session, to),
-                    Ok(Incoming::Rates { rates }) => session.app.broadcast_rates(session, rates, Instant::now()),
+                    Ok(Incoming::Rates { rates, progress }) => session.app.broadcast_rates(session, rates, progress, Instant::now()),
                     Err(_) => return End::Policy,
                 },
                 Some(Ok(Message::Binary(_))) => return End::Policy,
@@ -851,9 +874,9 @@ mod tests {
         let t = Instant::now();
         let first = json!({(slow.session.peer): 12});
         let next = json!({(slow.session.peer): 20});
-        app.broadcast_rates(&host.session, first.clone(), t);
-        app.broadcast_rates(&host.session, next.clone(), t + RATE_INTERVAL / 2);
-        app.broadcast_rates(&host.session, next.clone(), t + RATE_INTERVAL);
+        app.broadcast_rates(&host.session, first.clone(), None, t);
+        app.broadcast_rates(&host.session, next.clone(), None, t + RATE_INTERVAL / 2);
+        app.broadcast_rates(&host.session, next.clone(), None, t + RATE_INTERVAL);
         assert_eq!(queued(&mut fast), json!({"type": "rates", "rates": first}));
         assert_eq!(queued(&mut fast), json!({"type": "rates", "rates": next}));
         assert!(fast.outbox.is_empty());

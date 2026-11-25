@@ -7,6 +7,7 @@ const stunUrls = (import.meta.env.VITE_STUN_URLS ?? defaultStun)
     .map((url) => url.trim())
     .filter(Boolean);
 export const ROOM_CODE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+export const PROGRESS_MAX = 1000;
 const RTC_TIMEOUT = 8000;
 const RELAY_TIMEOUT = 18000;
 const RELAY_FAILED =
@@ -19,6 +20,7 @@ export class Room {
         this.peers = new Map();
         this.members = [];
         this.rates = {};
+        this.progress = {};
         this.status = "opening";
         const url = (this.signalUrl = new URL("/api/signal", window.location.href));
         url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -54,6 +56,7 @@ export class Room {
             host: this.host,
             members: this.members,
             rates: { ...this.rates },
+            progress: this.role === "host" ? this.recipientProgress() : this.progress,
             summary: this.summary,
             peers: Object.fromEntries(
                 [...this.peers].map(([id, { state, phase, bytes, error, route, download }]) => [
@@ -143,6 +146,7 @@ export class Room {
                 break;
             case "rates":
                 this.rates = message.rates;
+                this.progress = message.progress ?? {};
                 this.publish();
                 break;
             case "room-closed":
@@ -338,6 +342,21 @@ export class Room {
         }
     }
 
+    recipientProgress() {
+        const progress = {};
+        const total = this.selection?.summary.bytes ?? 0;
+        for (const { id, phase, bytes } of this.peers.values()) {
+            if (phase === "complete") progress[id] = PROGRESS_MAX;
+            else if (phase === "transferring") {
+                progress[id] =
+                    total > 0
+                        ? Math.min(PROGRESS_MAX - 1, Math.floor((bytes / total) * PROGRESS_MAX))
+                        : 0;
+            }
+        }
+        return progress;
+    }
+
     sample() {
         const now = performance.now();
         const elapsed = now - (this.sampledAt ?? now - 1000);
@@ -353,7 +372,7 @@ export class Room {
             }
         }
         if (this.role === "host" && this.members.length)
-            this.send({ type: "rates", rates: this.rates });
+            this.send({ type: "rates", rates: this.rates, progress: this.recipientProgress() });
         if (this.status === "open") this.publish();
     }
 
@@ -376,6 +395,7 @@ export class Room {
         this.status = "closed";
         this.error = reason;
         this.rates = {};
+        this.progress = {};
         clearInterval(this.timer);
         this.socket.close();
         for (const peer of this.peers.values()) this.closePeer(peer, reason);

@@ -1,6 +1,6 @@
 # One-off File Share
 
-Select files or folders, click **Share**, and send the invite link, code, or QR. Recipients join and accept the offer. Everyone in the room sees the roster and per-recipient transfer speeds. Use **HTTPS or localhost** for receiving.
+Select files or folders, click **Share**, and send the invite link, code, or QR. Recipients join and accept the offer. Everyone in the room sees the roster, transfer speeds, and other recipients' progress. Use **HTTPS or localhost** for receiving.
 
 - **Chrome / Edge on desktop:** Choose a destination folder. Files stream directly there.
 - **Firefox 111+ / Safari 26+:** Click **Receive files**, then **Download** once the transfer finishes. The browser stages the share in its private disk storage, not in RAM or on the server. A single file retains its name; folders and multiple files download as an uncompressed ZIP64 archive. Browser storage quotas apply, private browsing may block storage, and exporting needs space for both the staged and downloaded copies. For a 100 GB share, use the direct-to-folder option if possible. Keep the tab open until the download finishes, then use **Remove temporary copy** to reclaim browser storage. Inactive copies older than 24 hours are cleaned up on a later visit where browser locking is supported; clearing the site's data removes them immediately.
