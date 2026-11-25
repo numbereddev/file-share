@@ -43,7 +43,7 @@ class Transfer {
 
     report(phase, error) {
         this.phase = phase;
-        this.update({ phase, bytes: this.bytes, error });
+        this.update({ phase, bytes: this.bytes, error, download: this.download });
     }
 
     stop(reason) {
@@ -172,7 +172,11 @@ export class Receiver extends Transfer {
             try {
                 if (!this.stopped) await this.process(data);
             } catch (error) {
-                this.stop(error.message);
+                this.stop(
+                    error.name === "QuotaExceededError"
+                        ? "Not enough storage to finish this transfer."
+                        : error.message,
+                );
             } finally {
                 this.queuedBytes -= size;
                 this.queuedMessages--;
@@ -180,49 +184,20 @@ export class Receiver extends Transfer {
         });
     }
 
-    async accept(parent) {
+    accept(destination) {
         this.check();
-        if (!this.summary || this.root) throw new Error("No pending transfer.");
-        const folder = `File share ${crypto.randomUUID()}`;
-        const root = await parent.getDirectoryHandle(folder, { create: true });
-        this.check();
-        this.root = root;
+        if (!this.summary || this.destination) throw new Error("No pending transfer.");
+        this.destination = destination;
         this.send({ type: "accept" });
         this.report("transferring");
-        return folder;
     }
 
     cleanup() {
-        if (this.file && !this.file.committing) void this.discard(this.file);
-    }
-
-    async discard({ writer, directory, name }) {
-        await writer?.abort().catch(() => {});
-        await directory.removeEntry(name).catch(() => {});
-    }
-
-    async requireNew(directory, name, kind) {
-        try {
-            if (kind === "directory") await directory.getDirectoryHandle(name);
-            else await directory.getFileHandle(name);
-        } catch (error) {
-            if (error.name === "NotFoundError") {
-                this.check();
-                return;
-            }
-            throw error;
-        }
-        throw new Error(`A file or folder named ${name} already exists.`);
-    }
-
-    async directory(parts) {
-        let directory = this.root;
-        for (const part of parts) {
-            this.check();
-            directory = await directory.getDirectoryHandle(part);
-        }
-        this.check();
-        return directory;
+        if (this.phase === "complete") return;
+        const abort = this.file && !this.file.committing ? this.file.writer.abort() : undefined;
+        void Promise.allSettled([abort, this.queue])
+            .then(() => this.destination?.discard?.())
+            .catch(() => {});
     }
 
     async process(data) {
@@ -264,7 +239,7 @@ export class Receiver extends Transfer {
             this.report("offered");
             return;
         }
-        if (!this.root || this.phase === "complete")
+        if (!this.destination || this.phase === "complete")
             throw new Error("Unexpected transfer message.");
 
         switch (message.type) {
@@ -278,14 +253,14 @@ export class Receiver extends Transfer {
                 ) {
                     throw new Error("Unexpected file or folder.");
                 }
-                const name = parts.pop();
-                if (parts.length && this.entries.get(parts.join("/")) !== "directory")
+                if (
+                    parts.length > 1 &&
+                    this.entries.get(parts.slice(0, -1).join("/")) !== "directory"
+                )
                     throw new Error("Missing parent folder.");
                 this.entries.set(message.path, message.type);
-                const directory = await this.directory(parts);
-                await this.requireNew(directory, name, message.type);
                 if (message.type === "directory") {
-                    await directory.getDirectoryHandle(name, { create: true });
+                    await this.destination.addDirectory(parts);
                 } else {
                     if (
                         ++this.files > this.summary.files ||
@@ -294,15 +269,12 @@ export class Receiver extends Transfer {
                     ) {
                         throw new Error("Invalid file size or count.");
                     }
-                    const handle = await directory.getFileHandle(name, { create: true });
-                    const file = { directory, name, size: message.size, written: 0 };
+                    const writer = await this.destination.openFile(parts);
                     try {
                         this.check();
-                        file.writer = await handle.createWritable();
-                        this.check();
-                        this.file = file;
+                        this.file = { writer, size: message.size, written: 0 };
                     } catch (error) {
-                        await this.discard(file);
+                        await writer.abort().catch(() => {});
                         throw error;
                     }
                 }
@@ -320,7 +292,7 @@ export class Receiver extends Transfer {
                 try {
                     await this.file.writer.close();
                 } catch (error) {
-                    await this.discard(this.file);
+                    await this.file.writer.abort().catch(() => {});
                     throw error;
                 } finally {
                     this.file = null;
@@ -335,6 +307,7 @@ export class Receiver extends Transfer {
                 ) {
                     throw new Error("Incomplete transfer.");
                 }
+                this.download = await this.destination.finish?.();
                 this.send({ type: "ok" });
                 this.report("complete");
                 return;

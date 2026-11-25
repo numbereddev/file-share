@@ -47,9 +47,9 @@ export class Room {
             rates: { ...this.rates },
             summary: this.summary,
             peers: Object.fromEntries(
-                [...this.peers].map(([id, { state, phase, bytes, error, route }]) => [
+                [...this.peers].map(([id, { state, phase, bytes, error, route, download }]) => [
                     id,
-                    { state, phase, bytes, error, route },
+                    { state, phase, bytes, error, route, download },
                 ]),
             ),
         });
@@ -190,9 +190,9 @@ export class Room {
         }
     }
 
-    transferUpdate(peer, { phase, bytes, error }) {
-        const changed = peer.phase !== phase || peer.error !== error;
-        Object.assign(peer, { phase, bytes, error });
+    transferUpdate(peer, update) {
+        const changed = peer.phase !== update.phase || peer.error !== update.error;
+        Object.assign(peer, update);
         if (changed && this.status !== "closed") this.publish();
     }
 
@@ -201,10 +201,10 @@ export class Room {
         for (const peer of this.peers.values()) peer.transfer?.offer(selection);
     }
 
-    async accept(directory) {
+    accept(destination) {
         const receiver = this.peers.get(this.host)?.transfer;
         if (!receiver) throw new Error("No connection to the sender.");
-        return receiver.accept(directory);
+        receiver.accept(destination);
     }
 
     async findRoute(peer) {

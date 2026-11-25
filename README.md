@@ -1,6 +1,9 @@
 # One-off File Share
 
-Select files or folders, click **Share**, and send the invite link, code, or QR. Recipients join, see what is being offered, and choose a destination. Everyone in the room sees the roster and per-recipient transfer speeds. The recipient needs desktop Chromium (for example, Chrome or Edge) on **HTTPS or localhost** to stream to disk. The sender can use another browser with WebRTC; folder picker support varies.
+Select files or folders, click **Share**, and send the invite link, code, or QR. Recipients join and accept the offer. Everyone in the room sees the roster and per-recipient transfer speeds. Use **HTTPS or localhost** for receiving.
+
+- **Chrome / Edge on desktop:** Choose a destination folder. Files stream directly there.
+- **Firefox 111+ / Safari 26+:** Click **Receive files**, then **Download** once the transfer finishes. The browser stages the share in its private disk storage, not in RAM or on the server. A single file retains its name; folders and multiple files download as an uncompressed ZIP64 archive. Browser storage quotas apply, private browsing may block storage, and exporting needs space for both the staged and downloaded copies. For a 100 GB share, use the direct-to-folder option if possible. Keep the tab open until the download finishes, then use **Remove temporary copy** to reclaim browser storage. Inactive copies older than 24 hours are cleaned up on a later visit where browser locking is supported; clearing the site's data removes them immediately.
 
 ## Docker Compose
 
@@ -35,7 +38,7 @@ Open the site at its public HTTPS URL when creating an invite; that is the addre
 
 - **Direct when possible.** Rust exchanges WebRTC offers and ICE candidates and tracks the room and rates in memory. The sender reads slices from the original file and sends blocks up to 64 KiB over an encrypted, reliable data channel. The receiver writes them to disk and acknowledges batches of up to 4 MiB. Neither browser buffers the whole file, and the app has no fixed file-size cap below the browser or filesystem limits. Disk space, bandwidth, and both tabs staying open still matter; a 100 GB transfer was not benchmarked.
 - **One stream per recipient.** Up to eight guests can join the room. A late joiner starts at byte zero without interrupting anyone else. The original sender supplies each stream, so its total upload scales with the number of active recipients. Recipients do not re-seed or swarm in this version.
-- **Ephemeral.** A room has one file/folder selection. Leaving the room or disconnecting ends the session without resume. Received files are written into a new `File share …` subfolder. Completed files stay there if a later file is interrupted. Anyone with the invite can join while the room is open; recipients have to pick a destination before the sender starts writing to them.
+- **Ephemeral.** A room has one file/folder selection. Leaving the room or disconnecting ends the session without resume. Direct-to-folder transfers use a new `File share …` subfolder and keep any completed files if a later file is interrupted. The browser-storage fallback discards interrupted shares. Anyone with the invite can join while the room is open, but transfers start only after each recipient accepts.
 
 ### If direct connections fail
 

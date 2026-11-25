@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { Room, ROOM_CODE } from "./room.js";
+import { openDirectoryDestination } from "./destination.js";
+import { openStagedDestination, pruneStagedDownloads } from "./staging.js";
 import { fromDirectory, fromDrop, fromFiles } from "./selection.js";
 
 function formatBytes(bytes) {
@@ -83,10 +85,26 @@ export function App() {
     const [problem, setProblem] = useState("");
     const [copied, setCopied] = useState("");
     const [savedFolder, setSavedFolder] = useState("");
+    const [downloadRemoved, setDownloadRemoved] = useState(false);
+    const stage = useRef(null);
     const room = useRef(null);
     const selectionTask = useRef(null);
     const files = useRef(null);
     const folders = useRef(null);
+    const directSave = typeof window.showDirectoryPicker === "function";
+    const canStage =
+        typeof navigator.storage?.getDirectory === "function" &&
+        typeof window.FileSystemFileHandle?.prototype.createWritable === "function";
+    const canReceive = window.isSecureContext && (directSave || canStage);
+
+    function releaseStage() {
+        const previous = stage.current;
+        stage.current = null;
+        if (!previous) return;
+        // Do not invalidate a download the browser may still be saving.
+        if (previous.started) previous.destination.release();
+        else void previous.destination.discard().catch(previous.destination.release);
+    }
 
     function open(code) {
         if (room.current) return;
@@ -104,10 +122,17 @@ export function App() {
 
     useEffect(() => {
         if (joinCode) open(joinCode);
+        if (canStage) void pruneStagedDownloads().catch(() => {});
+        function onPageHide(event) {
+            if (!event.persisted) releaseStage();
+        }
+        window.addEventListener("pagehide", onPageHide);
         return () => {
+            window.removeEventListener("pagehide", onPageHide);
             const connection = room.current;
             room.current = null;
             connection?.end();
+            releaseStage();
         };
     }, []);
 
@@ -115,6 +140,7 @@ export function App() {
         const connection = room.current;
         room.current = null;
         connection?.end();
+        releaseStage();
         selectionTask.current = null;
         setView({ status: "idle" });
         setJoinCode("");
@@ -124,6 +150,7 @@ export function App() {
         setProblem("");
         setCopied("");
         setSavedFolder("");
+        setDownloadRemoved(false);
         if (location.hash) history.replaceState(null, "", location.pathname + location.search);
     }
 
@@ -162,16 +189,50 @@ export function App() {
         const connection = room.current;
         setPicking(true);
         setProblem("");
+        let destination;
         try {
-            const directory = await window.showDirectoryPicker({ mode: "readwrite" });
-            if (room.current !== connection) return;
-            const folder = await connection.accept(directory);
-            if (room.current === connection) setSavedFolder(folder);
+            if (directSave) {
+                const parent = await window.showDirectoryPicker({ mode: "readwrite" });
+                if (room.current !== connection) return;
+                destination = await openDirectoryDestination(parent);
+            } else {
+                destination = await openStagedDestination(view.summary);
+            }
+            if (room.current !== connection) {
+                await destination.discard?.();
+                return;
+            }
+            connection.accept(destination);
+            if (directSave) setSavedFolder(destination.folder);
+            else stage.current = { destination, started: false };
         } catch (error) {
-            if (room.current === connection && error.name !== "AbortError")
-                setProblem(error.message);
+            await destination?.discard?.().catch(() => {});
+            if (room.current === connection && error.name !== "AbortError") {
+                const unavailable =
+                    !directSave &&
+                    ["UnknownError", "NotAllowedError", "SecurityError"].includes(error.name);
+                setProblem(
+                    unavailable
+                        ? "Could not open browser storage. Try a regular window instead of private browsing."
+                        : error.message,
+                );
+            }
         } finally {
             if (room.current === connection) setPicking(false);
+        }
+    }
+
+    async function removeTemporaryCopy() {
+        const current = stage.current;
+        if (!current) return;
+        try {
+            await current.destination.discard();
+            if (stage.current === current) {
+                stage.current = null;
+                setDownloadRemoved(true);
+            }
+        } catch (error) {
+            if (stage.current === current) setProblem(error.message);
         }
     }
 
@@ -179,9 +240,9 @@ export function App() {
     const active = view.status === "open";
     const idle = view.status === "idle";
     const source = view.peers?.[view.host];
-    const canReceive = window.isSecureContext && typeof window.showDirectoryPicker === "function";
     const summary = guest ? view.summary : selection?.summary;
     const pending = active && source?.phase === "offered";
+    const download = !downloadRemoved && source?.phase === "complete" && source.download;
 
     return (
         <main
@@ -364,15 +425,42 @@ export function App() {
                     </>
                 )}
                 {guest && pending && canReceive && (
-                    <button className="primary" disabled={picking} onClick={receive}>
-                        Choose destination
-                    </button>
+                    <>
+                        <button className="primary" disabled={picking} onClick={receive}>
+                            {directSave ? "Choose destination" : "Receive files"}
+                        </button>
+                        {!directSave && (
+                            <small>
+                                Kept in temporary browser storage until you can download it.
+                            </small>
+                        )}
+                    </>
                 )}
                 {guest && active && !canReceive && (
                     <p className="error">
-                        Use Chrome or Edge on desktop over HTTPS (or localhost) to save files
-                        directly to disk.
+                        Receiving requires HTTPS or localhost and a browser that supports writing to
+                        disk.
                     </p>
+                )}
+                {download && (
+                    <>
+                        <a
+                            className="primary download"
+                            href={download.url}
+                            download={download.filename}
+                            onClick={() => {
+                                if (stage.current) stage.current.started = true;
+                            }}
+                        >
+                            Download
+                        </a>
+                        <small>
+                            Once your download finishes, you can remove the temporary copy.
+                        </small>
+                        <button className="plain" onClick={removeTemporaryCopy}>
+                            Remove temporary copy
+                        </button>
+                    </>
                 )}
                 {savedFolder && (
                     <small>

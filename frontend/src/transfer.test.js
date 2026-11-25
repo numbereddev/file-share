@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { fromFiles, pathParts } from "./selection.js";
+import { openDirectoryDestination } from "./destination.js";
 import { CHUNK, WINDOW, Receiver, Sender } from "./transfer.js";
 
 function channels() {
@@ -91,7 +92,9 @@ test("streams nested and empty entries with negotiated chunk size and commits ex
         sender.offer(selection);
         await until(() => receiver.summary);
         assert.equal(output.size, 0);
-        const folder = await receiver.accept(parent);
+        const dest = await openDirectoryDestination(parent);
+        receiver.accept(dest);
+        const { folder } = dest;
         await until(() => sender.phase === "complete" && receiver.phase === "complete");
         assert.equal(largest, 32 * 1024);
         assert.equal(sender.bytes, original.byteLength);
@@ -161,7 +164,7 @@ test("rejects paths outside the destination and unannounced entries", async () =
         JSON.stringify({ type: "summary", label: "invalid", bytes: 1, files: 1, entries: 1 }),
     );
     await until(() => receiver.summary);
-    await receiver.accept(parent);
+    receiver.accept(await openDirectoryDestination(parent));
     outgoing.send(JSON.stringify({ type: "file", path: "undeclared-parent/file", size: 1 }));
     await until(() => receiver.phase === "error");
     assert.equal(output.size, 0);
@@ -179,7 +182,9 @@ test("disconnect discards an unfinished file", async () => {
         JSON.stringify({ type: "summary", label: "interrupted", bytes: 4, files: 1, entries: 1 }),
     );
     await until(() => receiver.summary);
-    const folder = await receiver.accept(parent);
+    const dest = await openDirectoryDestination(parent);
+    receiver.accept(dest);
+    const { folder } = dest;
     outgoing.send(JSON.stringify({ type: "file", path: "partial", size: 4 }));
     await until(() => receiver.file);
     outgoing.send(new Uint8Array([1, 2]).buffer);

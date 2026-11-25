@@ -8,6 +8,7 @@
         "test": "bun test"
     },
     "dependencies": {
+        "@zip.js/zip.js": "^2.25.0",
         "qrcode.react": "^4.2.0",
         "react": "^19.1.0",
         "react-dom": "^19.1.0"

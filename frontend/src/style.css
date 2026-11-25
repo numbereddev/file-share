@@ -67,11 +67,17 @@ button:disabled {
     cursor: not-allowed;
     opacity: 0.5;
 }
-button.primary {
+button.primary,
+a.primary {
     background: #ededed;
     color: #111;
     font-weight: 600;
     padding-inline: 1.1rem;
+}
+a.download {
+    border-radius: 0.35rem;
+    padding-block: 0.4rem;
+    text-decoration: none;
 }
 button.plain {
     border: 0;
