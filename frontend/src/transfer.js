@@ -114,7 +114,9 @@ export class Sender extends Transfer {
 
     async run() {
         this.report("transferring");
-        const maximum = this.connection.sctp?.maxMessageSize ?? 16 * 1024;
+        const maximum = this.connection
+            ? (this.connection.sctp?.maxMessageSize ?? 16 * 1024)
+            : CHUNK;
         const chunk = Math.min(CHUNK, maximum || CHUNK);
         for (const { path, file } of this.selection.entries) {
             if (!file) {

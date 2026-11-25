@@ -51,6 +51,7 @@ input {
 }
 button,
 input[type="text"],
+input[type="password"],
 input[readonly] {
     border: 1px solid var(--line);
     background: #131313;

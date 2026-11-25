@@ -23,7 +23,7 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/api/signal", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
-            axum::serve(listener, router(AppState::new(None), None))
+            axum::serve(listener, router(AppState::new(None, None), None))
                 .await
                 .unwrap();
         });
@@ -78,9 +78,10 @@ async fn create(server: &Server) -> (Client, Uuid, Uuid) {
     let ready = receive(&mut client).await;
     let room = uuid_field(&ready, "room");
     let host = uuid_field(&ready, "peer");
+    let token = uuid_field(&ready, "relayToken");
     assert_eq!(
         ready,
-        json!({"type": "ready", "room": room, "peer": host, "role": "host"})
+        json!({"type": "ready", "room": room, "peer": host, "role": "host", "relayToken": token})
     );
     assert_eq!(receive(&mut client).await, roster(host, vec![]));
     (client, room, host)
@@ -97,9 +98,10 @@ async fn join(
     send(&mut guest, json!({"type": "join", "room": room})).await;
     let ready = receive(&mut guest).await;
     let peer = uuid_field(&ready, "peer");
+    let token = uuid_field(&ready, "relayToken");
     assert_eq!(
         ready,
-        json!({"type": "ready", "room": room, "peer": peer, "role": "guest"})
+        json!({"type": "ready", "room": room, "peer": peer, "role": "guest", "relayToken": token})
     );
     assert_eq!(
         receive(host).await,
@@ -223,9 +225,11 @@ async fn ready_precedes_an_immediate_signal_and_oversized_messages_disconnect() 
         json!({"type": "signal", "to": guest_id, "signal": offer}),
     )
     .await;
+    let ready = receive(&mut guest).await;
+    let token = uuid_field(&ready, "relayToken");
     assert_eq!(
-        receive(&mut guest).await,
-        json!({"type": "ready", "room": room, "peer": guest_id, "role": "guest"})
+        ready,
+        json!({"type": "ready", "room": room, "peer": guest_id, "role": "guest", "relayToken": token})
     );
     assert_eq!(receive(&mut guest).await, expected);
     assert_eq!(

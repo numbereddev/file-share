@@ -11,7 +11,15 @@ Select files or folders, click **Share**, and send the invite link, code, or QR.
 docker compose up -d --build
 ```
 
-The container serves the built React/Vite UI and Rust signaling on one port. Open `http://localhost:8080` for local use. By default, the port is published only on the host's loopback interface; set `APP_PORT` in `.env` to change it. No file volumes, database, or second web server are needed.
+The container serves the built React/Vite UI and Rust backend on one port. Open `http://localhost:8080` for local use. By default, the port is published only on the host's loopback interface; set `APP_PORT` in `.env` to change it. No file volumes, database, or second web server are needed.
+
+To restrict who can **create** a room, set a strong shared password in the Compose `.env`:
+
+```dotenv
+SHARE_PASSWORD='replace-with-a-long-random-password'
+```
+
+Apply an environment-only change with `docker compose up -d`. Clicking **Share** prompts for the password when it is configured. The Rust service enforces it; guests still join with just an invite. Unset or leave it empty for open room creation. Use HTTPS when exposing a password-protected site.
 
 ### Existing nginx on the host
 
@@ -32,17 +40,17 @@ location = /api/signal {
 }
 ```
 
-Open the site at its public HTTPS URL when creating an invite; that is the address encoded into the link and QR. File bytes never go through nginx, so nginx upload-size settings do not limit transfers. The signaling server sends heartbeat frames while idle.
+Open the site at its public HTTPS URL when creating an invite; that is the address encoded into the link and QR. The server relay uses the same `/api/signal` WebSocket location with `?relay=1`, so it needs no extra port or nginx rule. nginx's HTTP upload-size setting does not limit WebSocket transfers. The server sends heartbeat frames during idle connections.
 
 ## What happens to the file?
 
-- **Direct when possible.** Rust exchanges WebRTC offers and ICE candidates and tracks the room and rates in memory. The sender reads slices from the original file and sends blocks up to 64 KiB over an encrypted, reliable data channel. The receiver writes them to disk and acknowledges batches of up to 4 MiB. Neither browser buffers the whole file, and the app has no fixed file-size cap below the browser or filesystem limits. Disk space, bandwidth, and both tabs staying open still matter; a 100 GB transfer was not benchmarked.
+- **Direct when possible, server relay otherwise.** If a WebRTC data channel cannot open within about eight seconds, the app switches that recipient to an HTTPS WebSocket relay. Rust forwards blocks up to 64 KiB without saving files or buffering the whole transfer. Relayed bytes use server bandwidth and are visible to the server, unlike WebRTC file traffic. On both paths the receiver acknowledges batches of up to 4 MiB. Disk space, bandwidth, and both tabs staying open still matter; a 100 GB transfer was not benchmarked.
 - **One stream per recipient.** Up to eight guests can join the room. A late joiner starts at byte zero without interrupting anyone else. The original sender supplies each stream, so its total upload scales with the number of active recipients. Recipients do not re-seed or swarm in this version.
 - **Ephemeral.** A room has one file/folder selection. Leaving the room or disconnecting ends the session without resume. Direct-to-folder transfers use a new `File share …` subfolder and keep any completed files if a later file is interrupted. The browser-storage fallback discards interrupted shares. Anyone with the invite can join while the room is open, but transfers start only after each recipient accepts.
 
-### If direct connections fail
+### Optional WebRTC/TURN configuration
 
-The default STUN service is `stun:stun.l.google.com:19302`. Change the comma-separated `VITE_STUN_URLS` Compose build argument in `.env` and rebuild to use another service, or set it empty to disable STUN. A restrictive NAT or firewall may still require a publicly reachable TURN server. To use an existing coturn instance with `use-auth-secret` and `static-auth-secret`, set in `.env`:
+The default STUN service is `stun:stun.l.google.com:19302`. Change the comma-separated `VITE_STUN_URLS` Compose build argument in `.env` and rebuild to use another service, or set it empty to disable STUN. The built-in WebSocket relay does not require TURN. To also allow WebRTC to use an existing coturn instance with `use-auth-secret` and `static-auth-secret`, set in `.env`:
 
 ```dotenv
 TURN_URLS=turn:turn.example.com:3478?transport=udp,turns:turn.example.com:5349?transport=tcp
@@ -50,7 +58,7 @@ TURN_SECRET=replace-with-your-existing-coturn-shared-secret
 TURN_TTL_SECONDS=86400
 ```
 
-Rust issues time-limited credentials; do not put the shared secret into frontend build variables. TURN forwards encrypted packets separately for each recipient without storing files. It is not an HTTP upload or server-side fan-out and can consume substantial bandwidth. Protect publicly exposed TURN with suitable access controls and quotas: this app does not authenticate room creators.
+Rust issues time-limited credentials; do not put the shared secret into frontend build variables. TURN forwards encrypted packets separately for each recipient without storing files. Both types of relay can consume substantial bandwidth. Set `SHARE_PASSWORD` if you do not want the public creating rooms that use your server bandwidth.
 
 ## Local development
 

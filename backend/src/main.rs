@@ -27,7 +27,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let static_dir = env::var_os("STATIC_DIR")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from);
-    let app = router(signal::AppState::new(turn::Turn::from_env()?), static_dir);
+    let share_password = match env::var("SHARE_PASSWORD") {
+        Ok(password) => Some(password),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("SHARE_PASSWORD must be valid UTF-8".into());
+        }
+    };
+    let state = signal::AppState::new(turn::Turn::from_env()?, share_password.as_deref());
+    drop(share_password);
+    let app = router(state, static_dir);
     let listener = TcpListener::bind(bind_addr).await?;
     eprintln!("Listening on {}", listener.local_addr()?);
     axum::serve(listener, app).await?;

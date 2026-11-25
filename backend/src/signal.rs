@@ -1,3 +1,5 @@
+mod relay;
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -6,15 +8,17 @@ use std::{
 
 use axum::{
     extract::{
-        State,
+        RawQuery, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use futures_util::SinkExt;
+use futures_util::{Sink, SinkExt};
+use hmac::{Hmac, Mac, digest::CtOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha1::Sha1;
 use tokio::{
     sync::{Semaphore, mpsc, oneshot},
     time::{Instant, MissedTickBehavior, interval_at, timeout},
@@ -40,7 +44,7 @@ const PING: &[u8] = b"signal";
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum Hello {
-    Create,
+    Create { password: Option<String> },
     Join { room: Uuid },
 }
 
@@ -51,13 +55,16 @@ enum Incoming {
         to: Uuid,
         signal: Map<String, Value>,
     },
+    Relay {
+        to: Uuid,
+    },
     Rates {
         #[serde(default)]
         rates: Value,
     },
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Role {
     Host,
@@ -71,6 +78,8 @@ enum Outgoing<'a> {
         room: Uuid,
         peer: Uuid,
         role: Role,
+        #[serde(rename = "relayToken")]
+        relay_token: Uuid,
         #[serde(rename = "iceServers", skip_serializing_if = "Option::is_none")]
         ice_servers: Option<[IceServer<'a>; 1]>,
     },
@@ -79,6 +88,12 @@ enum Outgoing<'a> {
     },
     PeerLeft {
         peer: Uuid,
+    },
+    PasswordRequired {
+        incorrect: bool,
+    },
+    Relay {
+        guest: Uuid,
     },
     RoomClosed,
     Roster {
@@ -113,9 +128,20 @@ enum End {
     RoomClosed,
 }
 
+type SecretTag = CtOutput<Hmac<Sha1>>;
+
+fn tag(key: Uuid, domain: &[u8], value: &[u8]) -> SecretTag {
+    let mut mac =
+        Hmac::<Sha1>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(domain);
+    mac.update(value);
+    mac.finalize()
+}
+
 struct Peer {
     outbox: mpsc::Sender<String>,
     stop: oneshot::Sender<End>,
+    relay_tag: SecretTag,
 }
 
 impl Peer {
@@ -136,10 +162,15 @@ impl Peer {
     }
 }
 
+struct Guest {
+    peer: Peer,
+    relay: Option<relay::Slot>,
+}
+
 struct Room {
     host_id: Uuid,
     host: Peer,
-    guests: HashMap<Uuid, Peer>,
+    guests: HashMap<Uuid, Guest>,
     last_rates: Option<Instant>,
 }
 
@@ -150,12 +181,13 @@ impl Room {
         let stalled: Vec<_> = self
             .guests
             .iter()
-            .filter_map(|(&id, guest)| (!guest.has_space(1)).then_some(id))
+            .filter_map(|(&id, guest)| (!guest.peer.has_space(1)).then_some(id))
             .collect();
         for peer in stalled {
             self.guests
                 .remove(&peer)
                 .expect("guest was just checked")
+                .peer
                 .stop(End::Overloaded);
             if !self.host.enqueue(Outgoing::PeerLeft { peer }) {
                 return false;
@@ -174,7 +206,7 @@ impl Room {
         }
         for guest in self.guests.values() {
             // If a receiver closes after preflight, its session will remove it.
-            guest.enqueue_text(text.clone());
+            guest.peer.enqueue_text(text.clone());
         }
         true
     }
@@ -185,6 +217,9 @@ type Rooms = HashMap<Uuid, Room>;
 struct Inner {
     rooms: Mutex<Rooms>,
     connections: Arc<Semaphore>,
+    relay_connections: Arc<Semaphore>,
+    secret_key: Uuid,
+    password: Option<SecretTag>,
     turn: Option<Turn>,
 }
 
@@ -205,10 +240,17 @@ struct Connected {
 }
 
 impl AppState {
-    pub(crate) fn new(turn: Option<Turn>) -> Self {
+    pub(crate) fn new(turn: Option<Turn>, password: Option<&str>) -> Self {
+        let secret_key = Uuid::new_v4();
+        let password = password
+            .filter(|password| !password.is_empty())
+            .map(|password| tag(secret_key, b"password:", password.as_bytes()));
         Self(Arc::new(Inner {
             rooms: Mutex::new(HashMap::new()),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            relay_connections: Arc::new(Semaphore::new(relay::MAX_CONNECTIONS)),
+            secret_key,
+            password,
             turn,
         }))
     }
@@ -216,7 +258,7 @@ impl AppState {
     fn register(&self, hello: Hello) -> Result<Connected, &'static str> {
         let mut rooms = self.0.rooms.lock().expect("rooms lock poisoned");
         let (room_id, id, role) = match hello {
-            Hello::Create => {
+            Hello::Create { .. } => {
                 if rooms.len() >= MAX_ROOMS {
                     return Err("room limit reached");
                 }
@@ -245,15 +287,18 @@ impl AppState {
             .map_err(|_| "server clock unavailable")?;
         let (tx, outbox) = mpsc::channel(OUTBOX_CAPACITY);
         let (stop_tx, stop) = oneshot::channel();
+        let relay_token = Uuid::new_v4();
         let peer = Peer {
             outbox: tx,
             stop: stop_tx,
+            relay_tag: tag(self.0.secret_key, b"relay:", relay_token.as_bytes()),
         };
         // Queue ready before publishing this peer or notifying its host.
         if !peer.enqueue(Outgoing::Ready {
             room: room_id,
             peer: id,
             role,
+            relay_token,
             ice_servers,
         }) {
             return Err("could not initialize signaling");
@@ -277,7 +322,7 @@ impl AppState {
                     close_room(&mut rooms, room_id, Some(End::Overloaded));
                     return Err("room host unavailable");
                 }
-                room.guests.insert(id, peer);
+                room.guests.insert(id, Guest { peer, relay: None });
             }
         }
         if !rooms
@@ -306,7 +351,9 @@ impl AppState {
             return;
         };
         let target = match session.role {
-            Role::Host if room.host_id == session.peer => room.guests.get(&to),
+            Role::Host if room.host_id == session.peer => {
+                room.guests.get(&to).map(|guest| &guest.peer)
+            }
             Role::Guest if room.host_id == to && room.guests.contains_key(&session.peer) => {
                 Some(&room.host)
             }
@@ -323,6 +370,61 @@ impl AppState {
             Role::Host => remove_guest(&mut rooms, session.room, to, Some(End::Overloaded)),
             Role::Guest => close_room(&mut rooms, session.room, Some(End::Overloaded)),
         }
+    }
+
+    fn authorize_relay(&self, session: &Session, to: Uuid) {
+        if !matches!(session.role, Role::Host) {
+            return;
+        }
+        let mut rooms = self.0.rooms.lock().expect("rooms lock poisoned");
+        let Some(room) = rooms
+            .get_mut(&session.room)
+            .filter(|room| room.host_id == session.peer)
+        else {
+            return;
+        };
+        let Some(guest) = room.guests.get_mut(&to) else {
+            return;
+        };
+        if guest.relay.as_ref().is_some_and(relay::Slot::is_active) {
+            return;
+        }
+        if !room.host.has_space(1) {
+            close_room(&mut rooms, session.room, Some(End::Overloaded));
+        } else if !guest.peer.enqueue(Outgoing::Relay { guest: to }) {
+            remove_guest(&mut rooms, session.room, to, Some(End::Overloaded));
+        } else if !room.host.enqueue(Outgoing::Relay { guest: to }) {
+            close_room(&mut rooms, session.room, Some(End::Overloaded));
+        } else {
+            guest.relay = Some(relay::Slot::new());
+        }
+    }
+
+    fn attach_relay(
+        &self,
+        hello: relay::Hello,
+        socket: relay::Socket,
+    ) -> Result<Option<relay::Pairing>, relay::Socket> {
+        let presented = tag(self.0.secret_key, b"relay:", hello.token.as_bytes());
+        let mut rooms = self.0.rooms.lock().expect("rooms lock poisoned");
+        let Some(room) = rooms.get_mut(&hello.room) else {
+            return Err(socket);
+        };
+        let Some(guest) = room.guests.get_mut(&hello.guest) else {
+            return Err(socket);
+        };
+        let role = match (
+            presented == room.host.relay_tag,
+            presented == guest.peer.relay_tag,
+        ) {
+            (true, false) => Role::Host,
+            (false, true) => Role::Guest,
+            _ => return Err(socket),
+        };
+        let Some(slot) = &mut guest.relay else {
+            return Err(socket);
+        };
+        slot.attach(role, socket)
     }
 
     fn broadcast_rates(&self, session: &Session, rates: Value, now: Instant) {
@@ -354,8 +456,8 @@ impl AppState {
         room.last_rates = Some(now);
         let text = Outgoing::Rates { rates }.text();
         for guest in room.guests.values() {
-            if guest.has_space(RATE_CONTROL_RESERVE + 1) {
-                guest.enqueue_text(text.clone());
+            if guest.peer.has_space(RATE_CONTROL_RESERVE + 1) {
+                guest.peer.enqueue_text(text.clone());
             }
         }
     }
@@ -393,7 +495,7 @@ fn close_room(rooms: &mut Rooms, room_id: Uuid, host_reason: Option<End>) {
             room.host.stop(reason);
         }
         for guest in room.guests.into_values() {
-            guest.stop(End::RoomClosed);
+            guest.peer.stop(End::RoomClosed);
         }
     }
 }
@@ -406,14 +508,21 @@ fn remove_guest(rooms: &mut Rooms, room_id: Uuid, peer: Uuid, reason: Option<End
         return;
     };
     if let Some(reason) = reason {
-        guest.stop(reason);
+        guest.peer.stop(reason);
     }
     if !room.host.enqueue(Outgoing::PeerLeft { peer }) || !room.broadcast_roster() {
         close_room(rooms, room_id, Some(End::Overloaded));
     }
 }
 
-pub(crate) async fn upgrade(State(app): State<AppState>, ws: WebSocketUpgrade) -> Response {
+pub(crate) async fn upgrade(
+    State(app): State<AppState>,
+    RawQuery(query): RawQuery,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if query.is_some_and(|query| query.split('&').any(|entry| entry == "relay=1")) {
+        return relay::upgrade(ws, app);
+    }
     let Ok(permit) = app.0.connections.clone().try_acquire_owned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -439,6 +548,20 @@ async fn handle(mut socket: WebSocket, app: AppState) {
         Ok(Err(message)) => return reject(&mut socket, message).await,
         Err(_) => return reject(&mut socket, "timed out waiting for create or join").await,
     };
+    if let (Some(expected), Hello::Create { password }) = (&app.0.password, &hello) {
+        if !password.as_ref().is_some_and(|password| {
+            tag(app.0.secret_key, b"password:", password.as_bytes()) == *expected
+        }) {
+            let text = Outgoing::PasswordRequired {
+                incorrect: password.is_some(),
+            }
+            .text();
+            if send(&mut socket, Message::text(text)).await {
+                close(&mut socket, close_code::POLICY, "password required").await;
+            }
+            return;
+        }
+    }
     let Connected {
         session,
         mut outbox,
@@ -470,7 +593,7 @@ async fn handle(mut socket: WebSocket, app: AppState) {
             close(
                 &mut socket,
                 close_code::POLICY,
-                "expected a text signal or rates message",
+                "expected a text signal, rates, or relay message",
             )
             .await
         }
@@ -529,6 +652,7 @@ async fn run(
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                     Ok(Incoming::Signal { to, signal }) => session.app.relay(session, to, signal),
+                    Ok(Incoming::Relay { to }) => session.app.authorize_relay(session, to),
                     Ok(Incoming::Rates { rates }) => session.app.broadcast_rates(session, rates, Instant::now()),
                     Err(_) => return End::Policy,
                 },
@@ -551,7 +675,7 @@ async fn run(
     }
 }
 
-async fn send(socket: &mut WebSocket, message: Message) -> bool {
+async fn send(socket: &mut (impl Sink<Message> + Unpin), message: Message) -> bool {
     matches!(
         timeout(WRITE_TIMEOUT, socket.send(message)).await,
         Ok(Ok(()))
@@ -591,8 +715,8 @@ mod tests {
 
     #[test]
     fn overflow_evicts_guest_or_closes_room_without_waiting_for_a_writer() {
-        let app = AppState::new(None);
-        let mut host = app.register(Hello::Create).unwrap();
+        let app = AppState::new(None, None);
+        let mut host = app.register(Hello::Create { password: None }).unwrap();
         let room = host.session.room;
         let mut guest = app.register(Hello::Join { room }).unwrap();
         let mut healthy_guest = app.register(Hello::Join { room }).unwrap();
@@ -642,16 +766,16 @@ mod tests {
 
     #[test]
     fn limits_rooms_and_guests_and_reclaims_capacity() {
-        let app = AppState::new(None);
+        let app = AppState::new(None, None);
         let mut hosts = (0..MAX_ROOMS)
-            .map(|_| app.register(Hello::Create).unwrap())
+            .map(|_| app.register(Hello::Create { password: None }).unwrap())
             .collect::<Vec<_>>();
         assert!(matches!(
-            app.register(Hello::Create),
+            app.register(Hello::Create { password: None }),
             Err("room limit reached")
         ));
         drop(hosts.pop().unwrap());
-        let mut host = app.register(Hello::Create).unwrap();
+        let mut host = app.register(Hello::Create { password: None }).unwrap();
         let room = host.session.room;
         let mut guests = (0..MAX_GUESTS)
             .map(|_| app.register(Hello::Join { room }).unwrap())
@@ -676,8 +800,8 @@ mod tests {
 
     #[test]
     fn roster_excludes_stalled_guests_before_sending_to_healthy_peers() {
-        let app = AppState::new(None);
-        let mut host = app.register(Hello::Create).unwrap();
+        let app = AppState::new(None, None);
+        let mut host = app.register(Hello::Create { password: None }).unwrap();
         let room = host.session.room;
         let mut stalled = app.register(Hello::Join { room }).unwrap();
         let mut healthy = app.register(Hello::Join { room }).unwrap();
@@ -713,8 +837,8 @@ mod tests {
 
     #[test]
     fn rates_are_throttled_and_leave_queue_space_for_control_messages() {
-        let app = AppState::new(None);
-        let host = app.register(Hello::Create).unwrap();
+        let app = AppState::new(None, None);
+        let host = app.register(Hello::Create { password: None }).unwrap();
         let room = host.session.room;
         let mut slow = app.register(Hello::Join { room }).unwrap();
         let mut fast = app.register(Hello::Join { room }).unwrap();

@@ -83,6 +83,7 @@ export function App() {
     const [picking, setPicking] = useState(false);
     const [dragging, setDragging] = useState(false);
     const [problem, setProblem] = useState("");
+    const [needsPassword, setNeedsPassword] = useState(false);
     const [copied, setCopied] = useState("");
     const [savedFolder, setSavedFolder] = useState("");
     const [downloadRemoved, setDownloadRemoved] = useState(false);
@@ -106,17 +107,28 @@ export function App() {
         else void previous.destination.discard().catch(previous.destination.release);
     }
 
-    function open(code) {
+    function open(code, password) {
         if (room.current) return;
         if (code && !ROOM_CODE.test(code))
             return setProblem("Enter the room code from the sender.");
-        if (!window.RTCPeerConnection) return setProblem("This browser does not support WebRTC.");
         setProblem("");
         setView({ status: "opening", role: code ? "guest" : "host" });
-        const connection = new Room(code, selection, (value) => {
-            if (room.current === connection)
+        const connection = new Room(
+            code,
+            selection,
+            (value) => {
+                if (room.current !== connection) return;
+                if (value.passwordRequired) {
+                    room.current = null;
+                    setNeedsPassword(true);
+                    setView({ status: "idle" });
+                    setProblem(value.error ?? "");
+                    return;
+                }
                 setView(value.role ? value : { ...value, role: code ? "guest" : "host" });
-        });
+            },
+            password,
+        );
         room.current = connection;
     }
 
@@ -357,9 +369,32 @@ export function App() {
 
                 {idle && (
                     <>
-                        <button className="primary" onClick={() => open()}>
-                            Share
-                        </button>
+                        {needsPassword ? (
+                            <form
+                                className="join"
+                                onSubmit={(event) => {
+                                    event.preventDefault();
+                                    open(
+                                        undefined,
+                                        new FormData(event.currentTarget).get("password"),
+                                    );
+                                }}
+                            >
+                                <input
+                                    type="password"
+                                    name="password"
+                                    aria-label="Room creation password"
+                                    placeholder="Room creation password"
+                                    autoComplete="current-password"
+                                    required
+                                />
+                                <button className="primary">Create room</button>
+                            </form>
+                        ) : (
+                            <button className="primary" onClick={() => open()}>
+                                Share
+                            </button>
+                        )}
                         {selection && (
                             <button className="plain" onClick={() => setSelection(null)}>
                                 Clear selection

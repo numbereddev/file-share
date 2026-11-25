@@ -1,4 +1,5 @@
 import { Receiver, Sender } from "./transfer.js";
+import { relayChannel } from "./relay.js";
 
 const defaultStun = "stun:stun.l.google.com:19302";
 const stunUrls = (import.meta.env.VITE_STUN_URLS ?? defaultStun)
@@ -6,19 +7,26 @@ const stunUrls = (import.meta.env.VITE_STUN_URLS ?? defaultStun)
     .map((url) => url.trim())
     .filter(Boolean);
 export const ROOM_CODE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+const RTC_TIMEOUT = 8000;
+const RELAY_TIMEOUT = 18000;
+const RELAY_FAILED =
+    "Could not connect through the server. Check that the proxy allows WebSockets.";
 
 export class Room {
-    constructor(code, selection, onUpdate) {
+    constructor(code, selection, onUpdate, password) {
         this.selection = selection;
         this.onUpdate = onUpdate;
         this.peers = new Map();
         this.members = [];
         this.rates = {};
         this.status = "opening";
-        const url = new URL("/api/signal", window.location.href);
+        const url = (this.signalUrl = new URL("/api/signal", window.location.href));
         url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
         const socket = (this.socket = new WebSocket(url));
-        socket.onopen = () => this.send(code ? { type: "join", room: code } : { type: "create" });
+        socket.onopen = () => {
+            this.send(code ? { type: "join", room: code } : { type: "create", password });
+            socket.onopen = null;
+        };
         socket.onmessage = ({ data }) => {
             try {
                 this.message(JSON.parse(data));
@@ -39,6 +47,7 @@ export class Room {
         this.onUpdate({
             status: this.status,
             error: this.error,
+            passwordRequired: this.passwordRequired,
             code: this.code,
             me: this.me,
             role: this.role,
@@ -63,6 +72,7 @@ export class Room {
                 this.code = message.room;
                 this.me = message.peer;
                 this.role = message.role;
+                this.relayToken = message.relayToken;
                 this.host = this.role === "host" ? this.me : undefined;
                 this.config = {
                     iceServers: [
@@ -83,16 +93,21 @@ export class Room {
                 break;
             case "peer-joined": {
                 const peer = this.setup(message.peer);
+                peer.timeout = setTimeout(() => this.requestRelay(peer), RTC_TIMEOUT);
                 this.handle(peer, async () => {
-                    const channel = peer.pc.createDataChannel("file-share");
-                    const transfer = (peer.transfer = new Sender(channel, peer.pc, (state) =>
-                        this.transferUpdate(peer, state),
-                    ));
+                    const pc = this.openRtc(peer);
+                    const channel = pc.createDataChannel("file-share");
                     channel.onopen = () => {
-                        if (this.selection) transfer.offer(this.selection);
+                        if (peer.closed || peer.mode !== "negotiating") return channel.close();
+                        clearTimeout(peer.timeout);
+                        peer.mode = "direct";
+                        peer.state = "connected";
+                        this.bindTransfer(peer, channel, pc);
+                        this.publish();
                     };
-                    await peer.pc.setLocalDescription(await peer.pc.createOffer());
-                    this.signal(peer, { description: peer.pc.localDescription.toJSON() });
+                    await pc.setLocalDescription(await pc.createOffer());
+                    if (peer.pc === pc)
+                        this.signal(peer, { description: pc.localDescription.toJSON() });
                 });
                 break;
             }
@@ -108,9 +123,24 @@ export class Room {
                 const peer =
                     this.peers.get(message.from) ??
                     (this.role === "guest" ? this.setup(message.from) : null);
-                if (peer) this.handle(peer, () => this.handleSignal(peer, message.signal));
+                if (peer) {
+                    if (message.signal.relay === true && this.role === "host")
+                        this.requestRelay(peer);
+                    else this.handle(peer, () => this.handleSignal(peer, message.signal));
+                }
                 break;
             }
+            case "relay": {
+                const id = this.role === "host" ? message.guest : this.host;
+                if (!id || (this.role === "guest" && message.guest !== this.me)) break;
+                const peer = this.peers.get(id) ?? this.setup(id);
+                this.openRelay(peer, message.guest);
+                break;
+            }
+            case "password-required":
+                this.passwordRequired = true;
+                this.end(message.incorrect ? "Incorrect room password." : undefined);
+                break;
             case "rates":
                 this.rates = message.rates;
                 this.publish();
@@ -125,40 +155,122 @@ export class Room {
     }
 
     setup(id) {
-        const pc = new RTCPeerConnection(this.config);
         const peer = {
             id,
-            pc,
-            state: pc.connectionState,
+            mode: "negotiating",
+            state: "connecting",
             bytes: 0,
             sampled: 0,
             queue: Promise.resolve(),
             candidates: [],
         };
         this.peers.set(id, peer);
+        return peer;
+    }
+
+    openRtc(peer) {
+        const pc = (peer.pc = new RTCPeerConnection(this.config));
         pc.onicecandidate = ({ candidate }) => {
-            if (candidate) this.signal(peer, { candidate: candidate.toJSON() });
+            if (candidate && peer.pc === pc) this.signal(peer, { candidate: candidate.toJSON() });
         };
         pc.onconnectionstatechange = () => {
-            if (peer.closed) return;
+            if (peer.closed || peer.pc !== pc) return;
             peer.state = pc.connectionState;
-            if (peer.state === "failed")
-                this.closePeer(peer, "No network path. Try another network or configure TURN.");
+            if (peer.state === "failed") this.rtcFailed(peer);
             this.publish();
         };
         if (this.role === "guest") {
             pc.ondatachannel = ({ channel }) => {
-                if (channel.label !== "file-share" || peer.transfer) return channel.close();
-                peer.transfer = new Receiver(
-                    channel,
-                    (state) => this.transferUpdate(peer, state),
-                    (summary) => {
-                        this.summary = summary;
-                    },
-                );
+                if (
+                    peer.closed ||
+                    peer.pc !== pc ||
+                    channel.label !== "file-share" ||
+                    peer.transfer
+                )
+                    return channel.close();
+                this.bindTransfer(peer, channel, pc);
             };
         }
-        return peer;
+        return pc;
+    }
+
+    bindTransfer(peer, channel, pc) {
+        const update = (state) => {
+            if (!peer.closed && peer.transfer === transfer) this.transferUpdate(peer, state);
+        };
+        const transfer =
+            this.role === "host"
+                ? new Sender(channel, pc, update)
+                : new Receiver(channel, update, (summary) => {
+                      if (pc) peer.mode = "direct";
+                      this.summary = summary;
+                  });
+        peer.transfer = transfer;
+        if (this.role === "host" && this.selection) transfer.offer(this.selection);
+    }
+
+    rtcFailed(peer) {
+        if (peer.closed) return;
+        if (peer.mode === "direct") {
+            this.closePeer(peer, "Connection lost. Leave and rejoin to retry.");
+        } else if (peer.mode === "negotiating") {
+            if (this.role === "host") this.requestRelay(peer);
+            else {
+                this.waitForRelay(peer);
+                this.signal(peer, { relay: true });
+            }
+        }
+    }
+
+    requestRelay(peer) {
+        if (peer.closed || peer.mode !== "negotiating") return;
+        this.waitForRelay(peer);
+        this.send({ type: "relay", to: peer.id });
+    }
+
+    waitForRelay(peer) {
+        clearTimeout(peer.timeout);
+        peer.mode = "relay-requested";
+        const pc = peer.pc;
+        const transfer = peer.transfer;
+        peer.pc = null;
+        peer.transfer = null;
+        transfer?.stop();
+        pc?.close();
+        Object.assign(peer, {
+            state: "connecting",
+            phase: "waiting",
+            error: undefined,
+            route: "Server relay",
+        });
+        peer.timeout = setTimeout(() => this.closePeer(peer, RELAY_FAILED), RELAY_TIMEOUT);
+        this.publish();
+    }
+
+    openRelay(peer, guest) {
+        if (peer.closed || peer.relay || peer.mode === "direct") return;
+        this.waitForRelay(peer);
+        let channel;
+        try {
+            channel = peer.relay = relayChannel(this.signalUrl, {
+                room: this.code,
+                guest,
+                token: this.relayToken,
+            });
+        } catch {
+            this.closePeer(peer, RELAY_FAILED);
+            return;
+        }
+        const failed = () => this.closePeer(peer, RELAY_FAILED);
+        channel.onclose = failed;
+        channel.onerror = failed;
+        channel.onopen = () => {
+            clearTimeout(peer.timeout);
+            peer.mode = "relay";
+            peer.state = "connected";
+            this.bindTransfer(peer, channel, null);
+            this.publish();
+        };
     }
 
     signal(peer, signal) {
@@ -168,21 +280,22 @@ export class Room {
     handle(peer, task) {
         peer.queue = peer.queue
             .then(async () => {
-                if (!peer.closed) await task();
+                if (!peer.closed && (peer.mode === "negotiating" || peer.mode === "direct"))
+                    await task();
             })
-            .catch((error) => {
-                if (!peer.closed) this.closePeer(peer, error.message);
-            });
+            .catch(() => this.rtcFailed(peer));
     }
 
     async handleSignal(peer, { description, candidate }) {
-        const { pc } = peer;
+        if (!description && !candidate) return;
+        const pc = peer.pc ?? this.openRtc(peer);
         if (description) {
             await pc.setRemoteDescription(description);
             for (const pending of peer.candidates.splice(0)) await pc.addIceCandidate(pending);
             if (description.type === "offer") {
                 await pc.setLocalDescription(await pc.createAnswer());
-                this.signal(peer, { description: pc.localDescription.toJSON() });
+                if (peer.pc === pc)
+                    this.signal(peer, { description: pc.localDescription.toJSON() });
             }
         } else if (candidate) {
             if (pc.remoteDescription) await pc.addIceCandidate(candidate);
@@ -209,7 +322,9 @@ export class Room {
 
     async findRoute(peer) {
         try {
-            const stats = await peer.pc.getStats();
+            const pc = peer.pc;
+            const stats = await pc.getStats();
+            if (peer.pc !== pc || peer.closed) return;
             const transport = [...stats.values()].find((report) => report.selectedCandidatePairId);
             const pair = stats.get(transport?.selectedCandidatePairId);
             const local = stats.get(pair?.localCandidateId);
@@ -228,7 +343,7 @@ export class Room {
         const elapsed = now - (this.sampledAt ?? now - 1000);
         this.sampledAt = now;
         for (const peer of this.peers.values()) {
-            if (peer.state === "connected" && !peer.route) void this.findRoute(peer);
+            if (peer.pc && peer.state === "connected" && !peer.route) void this.findRoute(peer);
             if (this.role === "host") {
                 this.rates[peer.id] = Math.max(
                     0,
@@ -245,13 +360,15 @@ export class Room {
     closePeer(peer, reason = "Connection closed.") {
         if (peer.closed) return;
         peer.closed = true;
+        clearTimeout(peer.timeout);
         this.transferUpdate(peer, {
             phase: peer.phase === "complete" ? "complete" : "error",
             bytes: peer.bytes,
             error: peer.phase === "complete" ? undefined : reason,
         });
         peer.transfer?.stop(reason);
-        peer.pc.close();
+        peer.relay?.close();
+        peer.pc?.close();
     }
 
     end(reason) {
